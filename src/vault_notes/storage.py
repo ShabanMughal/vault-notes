@@ -58,6 +58,13 @@ class Vault:
         self._key = None
         self.items = []
 
+    def verify_password(self, password: str) -> bool:
+        try:
+            crypto.decrypt(self.path.read_bytes(), password)
+            return True
+        except crypto.WrongPassword:
+            return False
+
     def change_password(self, old: str, new: str) -> None:
         crypto.decrypt(self.path.read_bytes(), old)  # raises WrongPassword
         self._key = crypto.KeyInfo.new(new)

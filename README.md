@@ -9,9 +9,10 @@ Everything is stored in **one encrypted file on your PC**. Nothing is sent to th
 - **Global hotkey**: `Ctrl+Alt+N` shows or hides the app from any window; it lives in the system tray.
 - **Notes and logins**: plain notes, plus login entries with username, password, URL/server and extra notes.
 - **Instant search** across titles, notes, usernames and URLs.
+- **Windows Hello protection**: showing or copying a password asks for your fingerprint, face or PC PIN. After one check you won't be asked again for 60 seconds, and locking Windows resets it. If Windows Hello isn't set up, it asks for the master password instead.
 - **One-click copy**: copied passwords are cleared from the clipboard after 30 seconds.
 - **Password generator** for strong 20-character passwords.
-- **Auto-lock** after 5 minutes idle and whenever Windows is locked.
+- **No auto-lock**: the vault stays open until you lock it (`Ctrl+Shift+L`) or quit.
 - **Auto-save** while you type, with a `.bak` copy of the previous save.
 - **Backups** to any folder or USB drive (still encrypted).
 - **Start with Windows** option.
@@ -38,6 +39,7 @@ Windows SmartScreen may warn about an unknown publisher because the exe is not c
 - The key is derived from your master password with **scrypt** (N=2¹⁷, r=8, p=1, random 16-byte salt).
 - Data is encrypted with **AES-256-GCM**, which also detects a wrong password or a tampered file.
 - The vault is stored at `%LOCALAPPDATA%\VaultNotes\vault.vnx`.
+- Windows Hello is a "is it really you?" check before passwords are shown or copied. The encryption itself is still based on the master password, which is asked once when the app starts.
 - **There is no password recovery.** If you forget the master password, the data cannot be decrypted.
 
 This is a personal project and has not had a professional security audit.
@@ -74,9 +76,10 @@ vault-notes/
 │   ├── __main__.py                 # entry point (python -m vault_notes)
 │   ├── app.py                      # window, tray, editor, lock screen
 │   ├── crypto.py                   # scrypt + AES-256-GCM file format
+│   ├── hello.py                    # Windows Hello (fingerprint / PIN) prompt
 │   ├── storage.py                  # load/save/backup of the vault file
 │   └── winsys.py                   # hotkey, Windows-lock detection, autostart
-├── tests/test_vault.py
+├── tests/
 ├── pyproject.toml
 └── requirements.txt
 ```

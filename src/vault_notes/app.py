@@ -8,7 +8,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QPointF, QRectF, QSettings, Qt, QTimer
+from PySide6.QtCore import QPointF, QRectF, QSettings, Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPalette, QPixmap, QShortcut
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
@@ -36,11 +36,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import crypto, winsys
+from . import crypto, hello, winsys
 from .storage import Vault, default_vault_path, new_item
 
 APP_NAME = "Vault Notes"
-IDLE_LOCK_MS = 5 * 60 * 1000
+VERIFY_GRACE_S = 60  # after a fingerprint/PIN check, don't ask again for this long
 CLIPBOARD_CLEAR_MS = 30 * 1000
 SAVE_DELAY_MS = 700
 MIN_PASSWORD_LEN = 8
@@ -360,18 +360,20 @@ class ItemEditor(QWidget):
         self.reveal = QToolButton()
         self.reveal.setObjectName("small")
         self.reveal.setText("👁")
-        self.reveal.setToolTip("Show / hide password")
-        self.reveal.setCheckable(True)
-        self.reveal.toggled.connect(
-            lambda on: self.password.setEchoMode(QLineEdit.Normal if on else QLineEdit.Password)
-        )
+        self.reveal.setToolTip("Show password (asks for Windows Hello)")
+        self.reveal.clicked.connect(self.toggle_reveal)
         gen = QToolButton()
         gen.setObjectName("small")
         gen.setText("⟳")
         gen.setToolTip("Generate a strong password")
         gen.clicked.connect(self.generate)
+        copy_password = QToolButton()
+        copy_password.setObjectName("small")
+        copy_password.setText("Copy")
+        copy_password.setToolTip("Copy password (asks for Windows Hello)")
+        copy_password.clicked.connect(self.copy_password)
         form.addWidget(_field_label("Password"))
-        form.addLayout(self._row(self.password, self.reveal, gen, self._copy_button(self.password, "Password")))
+        form.addLayout(self._row(self.password, self.reveal, gen, copy_password))
 
         self.url = QLineEdit()
         self.url.setPlaceholderText("Website, server IP or host")
@@ -420,7 +422,7 @@ class ItemEditor(QWidget):
     def load(self, item: dict | None):
         self._loading = True
         self.item = item
-        self.reveal.setChecked(False)
+        self.set_revealed(False)
         if item is not None:
             is_login = item["type"] == "login"
             self.login_box.setVisible(is_login)
@@ -456,7 +458,32 @@ class ItemEditor(QWidget):
         ) != QMessageBox.Yes:
             return
         self.password.setText(generate_password())
-        self.reveal.setChecked(True)
+        self.set_revealed(True)
+
+    def set_revealed(self, visible: bool):
+        self.password.setEchoMode(QLineEdit.Normal if visible else QLineEdit.Password)
+        self.reveal.setText("🙈" if visible else "👁")
+        self.reveal.setToolTip("Hide password" if visible else "Show password (asks for Windows Hello)")
+
+    def toggle_reveal(self):
+        if self.password.echoMode() == QLineEdit.Normal:
+            self.set_revealed(False)
+        elif not self.password.text():
+            self.set_revealed(True)
+        else:
+            item = self.item
+            self.window_.require_verification(
+                "Vault Notes wants to show a password",
+                lambda: self.item is item and self.set_revealed(True),
+            )
+
+    def copy_password(self):
+        text = self.password.text()
+        if text:
+            self.window_.require_verification(
+                "Vault Notes wants to copy a password",
+                lambda: self.window_.copy_secret(text, "Password"),
+            )
 
 
 # ---------------------------------------------------------------- main page
@@ -636,6 +663,39 @@ class ChangePasswordDialog(QDialog):
         self.accept()
 
 
+class MasterPasswordPrompt(QDialog):
+    """Fallback check when Windows Hello isn't set up on this PC."""
+
+    def __init__(self, parent, vault: Vault):
+        super().__init__(parent)
+        self.vault = vault
+        self.setWindowTitle("Confirm it's you")
+        self.setMinimumWidth(340)
+        lay = QVBoxLayout(self)
+        hint = QLabel("Windows Hello isn't set up on this PC.\nEnter your master password to continue.")
+        hint.setObjectName("muted")
+        lay.addWidget(hint)
+        self.password = QLineEdit()
+        self.password.setEchoMode(QLineEdit.Password)
+        self.password.setPlaceholderText("Master password")
+        add_reveal_toggle(self.password)
+        lay.addWidget(self.password)
+        self.error = QLabel()
+        self.error.setObjectName("error")
+        lay.addWidget(self.error)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.submit)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+    def submit(self):
+        if self.vault.verify_password(self.password.text()):
+            self.accept()
+        else:
+            self.error.setText("Wrong master password.")
+            self.password.selectAll()
+
+
 # ---------------------------------------------------------------- window
 
 
@@ -662,13 +722,13 @@ class MainWindow(QMainWindow):
         self.statusBar().setStyleSheet("color: #8b8f96;")
 
         self.save_timer = QTimer(self, singleShot=True, interval=SAVE_DELAY_MS, timeout=self.save_now)
-        self.idle_timer = QTimer(self, singleShot=True, interval=IDLE_LOCK_MS, timeout=self.lock)
         self.copied_text: str | None = None
+        self.verified_until = 0.0
+        self.verifying = False
 
         self._build_menu()
         self._build_tray(icon)
         self._build_shortcuts()
-        QApplication.instance().installEventFilter(self)
         self.lock_page.reset()
 
     # -- setup
@@ -751,10 +811,38 @@ class MainWindow(QMainWindow):
             self.tray.showMessage(APP_NAME, "Still running in the tray. Press Ctrl+Alt+N to open it.", self.windowIcon())
             self.settings.setValue("tray_hint_shown", True)
 
-    def eventFilter(self, obj, event):
-        if event.type() in (QEvent.KeyPress, QEvent.MouseButtonPress, QEvent.Wheel) and self.vault.unlocked:
-            self.idle_timer.start()
-        return False
+    # -- Windows Hello for sensitive actions
+
+    def require_verification(self, reason: str, action):
+        """Runs `action` after Windows Hello (or the master password) confirms it's you.
+
+        After a successful check, further actions are allowed for VERIFY_GRACE_S seconds.
+        """
+        if time.monotonic() < self.verified_until:
+            action()
+            return
+        if self.verifying:
+            return
+
+        def done(result):
+            self.verifying = False
+            if result == hello.UNAVAILABLE:
+                if not MasterPasswordPrompt(self, self.vault).exec():
+                    return
+            elif result != hello.OK:
+                self.statusBar().showMessage("Verification cancelled", 3000)
+                return
+            self.verified_until = time.monotonic() + VERIFY_GRACE_S
+            action()
+
+        self.verifying = True
+        hello.verify(int(self.winId()), reason, done)
+
+    def forget_verification(self):
+        """Called when Windows locks: re-hide passwords and ask again next time."""
+        self.verified_until = 0.0
+        self.main_page.editor.set_revealed(False)
+        self.clear_clipboard()
 
     # -- lock / unlock
 
@@ -763,7 +851,6 @@ class MainWindow(QMainWindow):
         self.main_page.show_item(None)
         self.main_page.refresh()
         self.pages.setCurrentWidget(self.main_page)
-        self.idle_timer.start()
         self.focus_search()
 
     def lock(self):
@@ -774,8 +861,7 @@ class MainWindow(QMainWindow):
         self.main_page.list.clear()
         self.main_page.search.clear()
         self.vault.lock()
-        self.idle_timer.stop()
-        self.clear_clipboard()
+        self.forget_verification()
         self.lock_page.reset()
         self.pages.setCurrentWidget(self.lock_page)
 
@@ -913,7 +999,7 @@ def main(argv: list[str] | None = None) -> int:
     server.listen(INSTANCE_KEY)
     server.newConnection.connect(lambda: (server.nextPendingConnection(), window.show_window()))
 
-    native = winsys.NativeFilter(on_hotkey=window.toggle_window, on_session_lock=window.lock)
+    native = winsys.NativeFilter(on_hotkey=window.toggle_window, on_session_lock=window.forget_verification)
     app.installNativeEventFilter(native)
     if not winsys.register_hotkey("N"):
         window.tray.showMessage(APP_NAME, "Ctrl+Alt+N is used by another app, so the hotkey is off.", icon)
